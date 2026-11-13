@@ -8,8 +8,23 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 
 Config g_cfg;
+
+bool SceneQualityEnabled() { return g_cfg.sceneScale != 0; }
+
+// Facteur de la scène 4/3 (1920x1440 d'origine) pour une hauteur d'écran : en "auto", au moins deux fois
+// plus de lignes que l'écran (vrai super-sampling), plafonné à x3 pour la mémoire vidéo.
+UINT SceneScaleFor(UINT screenH)
+{
+    if (g_cfg.sceneScale >= 1) return (UINT)g_cfg.sceneScale;
+    if (g_cfg.sceneScale == 0 || screenH == 0) return 1;
+    UINT k = (2 * screenH + 1439) / 1440;
+    if (k < 1) k = 1;
+    if (k > 3) k = 3;
+    return k;
+}
 
 // ---------------------------------------------------------------------------
 // Proxy vers la vraie dinput8.dll du système
@@ -142,7 +157,7 @@ void* PatchVTable(void* object, int index, void* hook)
 // Configuration (.ini)
 // ---------------------------------------------------------------------------
 static const char kDefaultIni[] =
-    u8"; Options du mod bhd_mod (dinput8.dll) - Resident Evil HD Remaster\r\n"
+    u8"; Options du mod bhd_mod " BHD_MOD_VERSION " (dinput8.dll) - Resident Evil HD Remaster\r\n"
     u8"; Les changements sont pris en compte au prochain lancement du jeu.\r\n"
     u8"\r\n"
     u8"[Cursor]\r\n"
@@ -155,6 +170,22 @@ static const char kDefaultIni[] =
     u8"FullscreenCutscenes=1\r\n"
     u8"; 1 = le contenu de la bande noire du bas (sous-titres) est conservé en bas de l'image\r\n"
     u8"KeepSubtitles=1\r\n"
+    u8"; 1 = en \"rendu original\", les animations de porte s'affichent sur toute la largeur de l'écran\r\n"
+    u8"WideDoors=1\r\n"
+    u8"\r\n"
+    u8"[Display]\r\n"
+    u8"; Résolutions ajoutées au menu des options (jusqu'à 5, séparées par des virgules).\r\n"
+    u8";   auto = ajoute la résolution native de l'écran si le jeu ne la propose pas (2560x1440, 3840x2160...)\r\n"
+    u8";   Exemple : Resolutions=auto,3840x2160   -   Vide = liste d'origine du jeu.\r\n"
+    u8"; Elles remplacent 2560x1600, 1680x1050, 1360x768, 1152x864 et 1024x768.\r\n"
+    u8"; N'indiquez que des résolutions acceptées par votre écran ou votre pilote.\r\n"
+    u8"Resolutions=auto\r\n"
+    u8"; Qualité d'image de la scène en \"rendu original\" (4/3) :\r\n"
+    u8";   auto = super-sampling adapté à la résolution (x2 en 1080p/1440p, x3 en 4K) + réduction de qualité\r\n"
+    u8";   1 = taille d'origine, mais réduction de qualité au lieu du bilinéaire du jeu\r\n"
+    u8";   2, 3, 4 = facteur fixe   -   0 = désactivé (rendu d'origine du jeu)\r\n"
+    u8"; Choisissez la résolution native de votre écran dans le jeu (pas de DSR/VSR, inutile ici).\r\n"
+    u8"SceneScale=auto\r\n"
     u8"\r\n"
     u8"[Startup]\r\n"
     u8"; 1 = supprime l'écran d'avertissement de sauvegarde automatique au lancement\r\n"
@@ -219,6 +250,17 @@ static void LoadConfig()
     g_cfg.hideCursor          = GetPrivateProfileIntA("Cursor", "HideCursor", 1, ini) != 0;
     g_cfg.fullscreenCutscenes = GetPrivateProfileIntA("Cutscenes", "FullscreenCutscenes", 1, ini) != 0;
     g_cfg.keepSubtitles       = GetPrivateProfileIntA("Cutscenes", "KeepSubtitles", 1, ini) != 0;
+    g_cfg.wideDoors           = GetPrivateProfileIntA("Cutscenes", "WideDoors", 1, ini) != 0;
+    GetPrivateProfileStringA("Display", "Resolutions", "auto", g_cfg.resolutions, sizeof(g_cfg.resolutions), ini);
+    char scale[16] = {};
+    GetPrivateProfileStringA("Display", "SceneScale", "auto", scale, sizeof(scale), ini);
+    if (_stricmp(scale, "auto") == 0 || !scale[0]) {
+        g_cfg.sceneScale = -1;
+    } else {
+        g_cfg.sceneScale = atoi(scale);
+        if (g_cfg.sceneScale < 0) g_cfg.sceneScale = 0;
+        if (g_cfg.sceneScale > 4) g_cfg.sceneScale = 4;
+    }
     g_cfg.skipSaveNotice      = GetPrivateProfileIntA("Startup", "SkipSaveNotice", 1, ini) != 0;
     g_cfg.log                 = GetPrivateProfileIntA("Debug", "Log", 0, ini) != 0;
     g_cfg.dumpCode            = GetPrivateProfileIntA("Debug", "DumpCode", 0, ini) != 0;
@@ -228,8 +270,9 @@ static void LoadConfig()
         lstrcpyA(g_logPath, dir);
         lstrcatA(g_logPath, "bhd_mod.log");
         DeleteFileA(g_logPath);
-        Log("bhd_mod chargé - HideCursor=%d FullscreenCutscenes=%d KeepSubtitles=%d SkipSaveNotice=%d",
-            g_cfg.hideCursor, g_cfg.fullscreenCutscenes, g_cfg.keepSubtitles, g_cfg.skipSaveNotice);
+        Log("bhd_mod " BHD_MOD_VERSION " chargé - HideCursor=%d FullscreenCutscenes=%d KeepSubtitles=%d WideDoors=%d SkipSaveNotice=%d Resolutions=%s",
+            g_cfg.hideCursor, g_cfg.fullscreenCutscenes, g_cfg.keepSubtitles, g_cfg.wideDoors, g_cfg.skipSaveNotice,
+            g_cfg.resolutions);
     }
 }
 

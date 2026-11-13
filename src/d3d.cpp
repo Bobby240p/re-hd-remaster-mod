@@ -1,19 +1,18 @@
 // Hooks Direct3D 9 :
 //  - IDirect3DDevice9::ShowCursor forcé à FALSE (si HideCursor)
-//  - cinématiques letterbox en "rendu original" (4/3) agrandies pour remplir l'écran (si FullscreenCutscenes)
+//  - cinématiques en "rendu original" (4/3) agrandies pour remplir l'écran (si FullscreenCutscenes)
+//  - super-sampling de la scène 4/3 (si SceneScale >= 2) : décor agrandi sans lissage dans la scène
+//    agrandie, puis réduction finale en Lanczos (resample.cpp) à la place de celle du jeu
 //
-// Principe de la détection (à chaque Present, sur l'image finale) :
-//  * l'image 4/3 est centrée dans le backbuffer, avec des bandes noires à gauche et à droite ;
-//  * pendant une cinématique, le jeu ajoute des bandes noires en haut et en bas DANS la zone 4/3 ;
-//  * on copie quelques colonnes de pixels, on cherche des bandes noires horizontales nettes et
-//    symétriques ; si elles sont stables plusieurs images de suite, on verrouille le rectangle utile
-//    et on l'agrandit à l'écran en conservant son ratio ;
-//  * on sort du mode dès que du contenu apparaît dans la bande du haut (ou près du bord de celle du bas)
-//    ou que les bandes latérales ne sont plus noires. Une image entièrement noire (fondu) ne change rien.
+// Les cinématiques ne sont pas détectées en analysant l'image : on lit l'état du jeu (voir patches.cpp,
+// Game_LetterboxActive) au moment de l'affichage de chaque image. Quand le jeu affiche ses bandes noires,
+// on agrandit la partie entre les bandes, avec la géométrie exacte utilisée par le jeu.
 
 #include "common.h"
+#include "resample.h"
 #include <d3d9.h>
-#include <stdlib.h>
+
+bool Game_LetterboxActive(); // patches.cpp
 
 namespace {
 
@@ -23,6 +22,13 @@ typedef HRESULT(STDMETHODCALLTYPE* Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAME
 typedef HRESULT(STDMETHODCALLTYPE* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 typedef HRESULT(STDMETHODCALLTYPE* SCPresent_t)(IDirect3DSwapChain9*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
 typedef BOOL(STDMETHODCALLTYPE* DevShowCursor_t)(IDirect3DDevice9*, BOOL);
+typedef HRESULT(STDMETHODCALLTYPE* CreateTexture_t)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+typedef HRESULT(STDMETHODCALLTYPE* SetRenderTarget_t)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+typedef HRESULT(STDMETHODCALLTYPE* SetTexture_t)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+typedef HRESULT(STDMETHODCALLTYPE* DrawPrimitive_t)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+typedef HRESULT(STDMETHODCALLTYPE* DrawIndexedPrimitive_t)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+typedef HRESULT(STDMETHODCALLTYPE* DrawPrimitiveUP_t)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+typedef HRESULT(STDMETHODCALLTYPE* DrawIndexedPrimitiveUP_t)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT);
 
 Direct3DCreate9_t oDirect3DCreate9 = nullptr;
 CreateDevice_t    oCreateDevice    = nullptr;
@@ -30,222 +36,249 @@ Reset_t           oReset           = nullptr;
 Present_t         oPresent         = nullptr;
 SCPresent_t       oSCPresent       = nullptr;
 DevShowCursor_t   oDevShowCursor   = nullptr;
+CreateTexture_t      oCreateTexture      = nullptr;
+SetRenderTarget_t        oSetRenderTarget        = nullptr;
+SetTexture_t             oSetTexture             = nullptr;
+DrawPrimitive_t          oDrawPrimitive          = nullptr;
+DrawIndexedPrimitive_t   oDrawIndexedPrimitive   = nullptr;
+DrawPrimitiveUP_t        oDrawPrimitiveUP        = nullptr;
+DrawIndexedPrimitiveUP_t oDrawIndexedPrimitiveUP = nullptr;
 
 // Index dans les vtables
-const int kVT_D3D_CreateDevice   = 16;
-const int kVT_Dev_ShowCursor     = 12;
-const int kVT_Dev_Reset          = 16;
-const int kVT_Dev_Present        = 17;
-const int kVT_SwapChain_Present  = 3;
+const int kVT_D3D_CreateDevice  = 16;
+const int kVT_Dev_ShowCursor    = 12;
+const int kVT_Dev_Reset         = 16;
+const int kVT_Dev_Present       = 17;
+const int kVT_SwapChain_Present = 3;
 
-// Échantillonnage
-const int kPillarCols = 4;   // colonnes dans les bandes latérales
-const int kInnerCols  = 24;  // colonnes dans la zone 4/3
-const int kCols       = kPillarCols + kInnerCols;
-const int kBlackMax   = 8;   // composante <= kBlackMax => pixel considéré noir
-const int kEnterFrames = 4;  // images stables nécessaires pour entrer en mode cinématique
+// Géométrie des bandes du jeu, dans son repère d'interface 1280x720 (voir patches.cpp) :
+// l'image utile va de la ligne 56 (58 - 2) à la ligne 662 (720 - 58).
+const float kUiHeight     = 720.f;
+const float kContentTop   = 56.f;
+const float kContentBot   = 662.f;
 
 struct State {
-    IDirect3DDevice9*  dev       = nullptr;
+    IDirect3DDevice9*  dev      = nullptr;
     UINT               w = 0, h = 0;
-    D3DFORMAT          fmt       = D3DFMT_UNKNOWN;
-    bool               usable    = false;
-    IDirect3DTexture9* copyTex   = nullptr;
-    IDirect3DSurface9* copySurf  = nullptr;
-    IDirect3DSurface9* sampleRT  = nullptr;
-    IDirect3DSurface9* sampleSys = nullptr;
-    int  x0 = 0, x43 = 0;
-    int  colX[kCols] = {};
-
-    bool active   = false;
-    int  streak   = 0;
-    int  candTop  = -1, candBot = -1;
-    int  lockTop  = 0,  lockBot = 0;   // lignes de contenu [lockTop, lockBot]
-    unsigned frame = 0;
-    bool inPresent = false;
+    D3DFORMAT          fmt      = D3DFMT_UNKNOWN;
+    IDirect3DTexture9* copyTex  = nullptr;
+    IDirect3DSurface9* copySurf = nullptr;
+    bool               active   = false;
+    bool               inPresent = false;
 } S;
 
 template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+// --- Super-sampling de la scène 4/3 : réduction finale en Lanczos -------------------------------
+// Les images de la scène agrandie (SceneScale) sont repérées à leur création. Quand le jeu en dessine
+// une sur une cible de la taille de l'écran (composition finale), on la réduit d'abord nous-mêmes en
+// Lanczos à la taille exacte de destination, et on la lui substitue avec un échantillonnage au pixel
+// près : le jeu la recopie 1:1, ses propres effets (filtre, fondus, couleurs) restent appliqués.
+struct Scene {
+    IDirect3DBaseTexture9* textures[16] = {};   // images de la scène agrandie (non possédées)
+    int                    count = 0, next = 0;
+    IDirect3DBaseTexture9* bound[16] = {};      // textures liées par le jeu, par étage
+    UINT                   rtW = 0, rtH = 0;    // cible de rendu 0 courante du jeu
+    UINT                   bbW = 0, bbH = 0;    // taille de l'écran (backbuffer)
+    IDirect3DTexture9*     smallTex = nullptr;     // scène réduite (taille de destination)
+    UINT                   smallW = 0, smallH = 0;
+    IDirect3DBaseTexture9* lastSrc = nullptr;
+    unsigned               lastFrame = ~0u;
+    unsigned               frame = 0;
+    bool                   inOwn = false;       // nos propres appels : ne pas suivre / intercepter
+    UINT                   loggedW = 0, loggedH = 0;
+    bool                   loggedBg = false;
+} G;
+
+bool IsSceneTexture(IDirect3DBaseTexture9* t)
+{
+    if (!t) return false;
+    for (int i = 0; i < G.count; ++i) if (G.textures[i] == t) return true;
+    return false;
+}
+
+void SceneForget()
+{
+    G.count = 0; G.next = 0;
+    for (auto& b : G.bound) b = nullptr;
+    SafeRelease(G.smallTex);
+    G.smallW = G.smallH = 0;
+    G.lastSrc = nullptr;
+    G.bbW = G.bbH = 0;
+}
+
+// Réduit `src` vers G.smallTex (dstW x dstH) avec le filtre donné. Renvoie G.smallTex, ou nullptr.
+IDirect3DTexture9* SceneDownsample(IDirect3DDevice9* dev, IDirect3DTexture9* src, UINT dstW, UINT dstH,
+                                   ResampleFilter filter)
+{
+    if (G.lastSrc == src && G.lastFrame == G.frame && G.smallTex && G.smallW == dstW && G.smallH == dstH)
+        return G.smallTex;
+    if (!G.smallTex || G.smallW != dstW || G.smallH != dstH) {
+        SafeRelease(G.smallTex);
+        if (FAILED(dev->CreateTexture(dstW, dstH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                      &G.smallTex, nullptr)))
+            return nullptr;
+        G.smallW = dstW; G.smallH = dstH;
+    }
+    D3DSURFACE_DESC sd;
+    IDirect3DSurface9* dst = nullptr;
+    if (FAILED(src->GetLevelDesc(0, &sd)) || FAILED(G.smallTex->GetSurfaceLevel(0, &dst))) return nullptr;
+
+    // Sauvegarde complète de l'état du jeu.
+    IDirect3DStateBlock9* sb = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) { dst->Release(); return nullptr; }
+    IDirect3DSurface9* oldRT[4] = {};
+    for (DWORD i = 0; i < 4; ++i) dev->GetRenderTarget(i, &oldRT[i]);
+    IDirect3DSurface9* oldDS = nullptr;
+    dev->GetDepthStencilSurface(&oldDS);
+    IDirect3DVertexBuffer9* vb = nullptr; UINT vbOff = 0, vbStride = 0;
+    dev->GetStreamSource(0, &vb, &vbOff, &vbStride);
+    IDirect3DIndexBuffer9* ib = nullptr;
+    dev->GetIndices(&ib);
+
+    const RECT srcRect = { 0, 0, (LONG)sd.Width, (LONG)sd.Height };
+    const RECT dstRect = { 0, 0, (LONG)dstW, (LONG)dstH };
+    const bool ok = Resample(dev, src, srcRect, dst, dstRect, filter);
+
+    for (DWORD i = 0; i < 4; ++i) {
+        if (i > 0 || oldRT[0]) dev->SetRenderTarget(i, oldRT[i]);
+        SafeRelease(oldRT[i]);
+    }
+    dev->SetDepthStencilSurface(oldDS);
+    SafeRelease(oldDS);
+    sb->Apply();
+    sb->Release();
+    dev->SetStreamSource(0, vb, vbOff, vbStride);
+    dev->SetIndices(ib);
+    SafeRelease(vb);
+    SafeRelease(ib);
+    dst->Release();
+
+    if (!ok) return nullptr;
+    G.lastSrc = src;
+    G.lastFrame = G.frame;
+    if (G.loggedW != sd.Width || G.loggedH != dstH) {
+        G.loggedW = sd.Width; G.loggedH = dstH;
+        Log("Composition de la scène : %ux%u -> %ux%u (%s)", sd.Width, sd.Height, dstW, dstH,
+            filter == ResampleFilter::Box ? "moyenne exacte, rapport entier" : "Lanczos");
+    }
+    return G.smallTex;
+}
+
+// Décor précalculé (ou sa carte de profondeur) : texture 2D ordinaire de 1920x1440.
+bool IsBackgroundTexture(IDirect3DBaseTexture9* t)
+{
+    if (!t || t->GetType() != D3DRTYPE_TEXTURE) return false;
+    D3DSURFACE_DESC d;
+    return SUCCEEDED(((IDirect3DTexture9*)t)->GetLevelDesc(0, &d)) && d.Width == 1920 && d.Height == 1440 &&
+           !(d.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL));
+}
+
+// Dessin dans la scène agrandie : le décor (1920x1440) y est agrandi exactement x SceneScale. On force
+// l'échantillonnage au plus proche voisin : chaque pixel du décor devient un bloc entier, sans lissage.
+template <class F> HRESULT BackgroundDraw(IDirect3DDevice9* dev, F draw)
+{
+    DWORD saved[16][2];
+    bool changed[16] = {};
+    bool any = false;
+    G.inOwn = true;
+    for (DWORD s = 0; s < 16; ++s) {
+        if (!IsBackgroundTexture(G.bound[s])) continue;
+        dev->GetSamplerState(s, D3DSAMP_MINFILTER, &saved[s][0]);
+        dev->GetSamplerState(s, D3DSAMP_MAGFILTER, &saved[s][1]);
+        dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        changed[s] = any = true;
+    }
+    G.inOwn = false;
+    if (any && !G.loggedBg) {
+        G.loggedBg = true;
+        Log("Décor agrandi sans lissage dans la scène x%u", G.rtH / 1440);
+    }
+    HRESULT hr = draw();
+    if (any) {
+        G.inOwn = true;
+        for (DWORD s = 0; s < 16; ++s)
+            if (changed[s]) {
+                dev->SetSamplerState(s, D3DSAMP_MINFILTER, saved[s][0]);
+                dev->SetSamplerState(s, D3DSAMP_MAGFILTER, saved[s][1]);
+            }
+        G.inOwn = false;
+    }
+    return hr;
+}
+
+// Enveloppe un appel de dessin du jeu : substitue la scène réduite si c'est la composition finale.
+template <class F> HRESULT SceneDraw(IDirect3DDevice9* dev, F draw)
+{
+    if (G.inOwn || S.inPresent || G.count == 0) return draw();
+    // Dessin dans la scène agrandie (multiple entier de 1920x1440) : décor sans lissage.
+    if (G.rtH > 1440 && G.rtH % 1440 == 0 && G.rtW * 3 == G.rtH * 4) return BackgroundDraw(dev, draw);
+    if (!G.bbW || G.rtW != G.bbW || G.rtH != G.bbH) return draw();
+    int stage = -1;
+    for (int s = 0; s < 16; ++s)
+        if (IsSceneTexture(G.bound[s])) { stage = s; break; }
+    if (stage < 0) return draw();
+
+    // Zone 4/3 à l'écran (écran plus large que 4/3 : hauteur pleine ; plus étroit : largeur pleine).
+    UINT dstW, dstH;
+    if (G.rtW * 3 >= G.rtH * 4) { dstH = G.rtH; dstW = (G.rtH * 4 + 1) / 3; }
+    else                        { dstW = G.rtW; dstH = (G.rtW * 3 + 2) / 4; }
+
+    D3DSURFACE_DESC sd;
+    if (FAILED(((IDirect3DTexture9*)G.bound[stage])->GetLevelDesc(0, &sd))) return draw();
+    if (sd.Width == dstW && sd.Height == dstH) return draw();   // déjà à la bonne taille : rien à faire
+
+    // Rapport entier et décor tombant pile sur les pixels de l'écran (1440p, 5K...) : moyenne exacte,
+    // le décor est restitué pixel pour pixel. Sinon : Lanczos.
+    const bool exact = dstH % 1440 == 0 && sd.Height % dstH == 0 && sd.Width % dstW == 0;
+    const ResampleFilter filter = exact ? ResampleFilter::Box : ResampleFilter::Lanczos;
+
+    G.inOwn = true;
+    IDirect3DTexture9* reduced = SceneDownsample(dev, (IDirect3DTexture9*)G.bound[stage], dstW, dstH, filter);
+    if (!reduced) { G.inOwn = false; return draw(); }
+
+    IDirect3DBaseTexture9* orig = G.bound[stage];
+    DWORD minF = 0, magF = 0;
+    dev->GetSamplerState(stage, D3DSAMP_MINFILTER, &minF);
+    dev->GetSamplerState(stage, D3DSAMP_MAGFILTER, &magF);
+    oSetTexture(dev, stage, reduced);
+    dev->SetSamplerState(stage, D3DSAMP_MINFILTER, D3DTEXF_POINT); // recopie 1:1, aucun lissage
+    dev->SetSamplerState(stage, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    G.inOwn = false;
+
+    HRESULT hr = draw();
+
+    G.inOwn = true;
+    oSetTexture(dev, stage, orig);
+    dev->SetSamplerState(stage, D3DSAMP_MINFILTER, minF);
+    dev->SetSamplerState(stage, D3DSAMP_MAGFILTER, magF);
+    G.inOwn = false;
+    return hr;
+}
 
 void ReleaseResources()
 {
     SafeRelease(S.copySurf);
     SafeRelease(S.copyTex);
-    SafeRelease(S.sampleRT);
-    SafeRelease(S.sampleSys);
-    S.usable = false;
     S.w = S.h = 0;
     S.fmt = D3DFMT_UNKNOWN;
-    S.active = false;
-    S.streak = 0;
 }
 
 bool EnsureResources(IDirect3DDevice9* dev, const D3DSURFACE_DESC& d)
 {
     if (S.dev != dev) { ReleaseResources(); S.dev = dev; }
-    if (S.usable && S.w == d.Width && S.h == d.Height && S.fmt == d.Format) return true;
-
-    // Configuration déjà jugée inutilisable pour cette taille/format : ne pas réessayer à chaque image.
-    static UINT badW = 0, badH = 0; static D3DFORMAT badF = D3DFMT_UNKNOWN;
-    if (!S.usable && d.Width == badW && d.Height == badH && d.Format == badF) return false;
-
+    if (S.copyTex && S.w == d.Width && S.h == d.Height && S.fmt == d.Format) return true;
     ReleaseResources();
-    S.w = d.Width; S.h = d.Height; S.fmt = d.Format;
-    Log("Backbuffer %ux%u format=%d msaa=%d", d.Width, d.Height, (int)d.Format, (int)d.MultiSampleType);
-
-    auto fail = [&](const char* why) {
-        Log("Cinématiques plein écran inactives : %s", why);
-        badW = d.Width; badH = d.Height; badF = d.Format;
-        ReleaseResources();
-        return false;
-    };
-
-    if (d.Format != D3DFMT_X8R8G8B8 && d.Format != D3DFMT_A8R8G8B8)
-        return fail("format du backbuffer non géré");
-
-    S.x43 = (int)((d.Height * 4 + 1) / 3);
-    if ((int)d.Width < S.x43 + 16)
-        return fail("l'écran n'est pas plus large que 4/3");
-    S.x0 = ((int)d.Width - S.x43) / 2;
-
     if (FAILED(dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &S.copyTex, nullptr)) ||
-        FAILED(S.copyTex->GetSurfaceLevel(0, &S.copySurf)) ||
-        FAILED(dev->CreateRenderTarget(kCols, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &S.sampleRT, nullptr)) ||
-        FAILED(dev->CreateOffscreenPlainSurface(kCols, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &S.sampleSys, nullptr))) {
-        // Peut arriver si le périphérique est perdu : on réessaiera plus tard.
-        Log("Création des ressources impossible (réessai plus tard)");
+        FAILED(S.copyTex->GetSurfaceLevel(0, &S.copySurf))) {
+        Log("Création de la texture de copie impossible (%ux%u format=%d)", d.Width, d.Height, (int)d.Format);
         ReleaseResources();
         return false;
     }
-
-    const int w = (int)d.Width;
-    const int x1 = S.x0 + S.x43;
-    S.colX[0] = S.x0 / 4;
-    S.colX[1] = S.x0 * 3 / 4;
-    S.colX[2] = x1 + (w - x1) / 4;
-    S.colX[3] = x1 + (w - x1) * 3 / 4;
-    const int margin = S.x43 * 3 / 100;
-    for (int i = 0; i < kInnerCols; ++i)
-        S.colX[kPillarCols + i] = S.x0 + margin + (S.x43 - 2 * margin - 1) * i / (kInnerCols - 1);
-    for (int i = 0; i < kCols; ++i) {
-        if (S.colX[i] < 0) S.colX[i] = 0;
-        if (S.colX[i] > w - 1) S.colX[i] = w - 1;
-    }
-
-    S.usable = true;
-    Log("Zone 4/3 : x=%d largeur=%d", S.x0, S.x43);
+    S.w = d.Width; S.h = d.Height; S.fmt = d.Format;
+    Log("Backbuffer %ux%u format=%d", d.Width, d.Height, (int)d.Format);
     return true;
-}
-
-inline bool IsBlack(DWORD p)
-{
-    return ((p >> 16) & 0xFF) <= kBlackMax && ((p >> 8) & 0xFF) <= kBlackMax && (p & 0xFF) <= kBlackMax;
-}
-
-void Analyze(const BYTE* bits, int pitch)
-{
-    const int h = (int)S.h;
-    auto px = [&](int c, int y) { return *(const DWORD*)(bits + y * pitch + c * 4); };
-
-    bool pillarBlack = true;
-    for (int c = 0; c < kPillarCols && pillarBlack; ++c)
-        for (int y = 0; y < h; ++y)
-            if (!IsBlack(px(c, y))) { pillarBlack = false; break; }
-
-    int top[kInnerCols], bot[kInnerCols], nonEmpty = 0;
-    for (int i = 0; i < kInnerCols; ++i) {
-        const int c = kPillarCols + i;
-        int t = -1, b = -1;
-        for (int y = 0; y < h; ++y)
-            if (!IsBlack(px(c, y))) { t = y; break; }
-        if (t >= 0) {
-            for (int y = h - 1; y >= t; --y)
-                if (!IsBlack(px(c, y))) { b = y; break; }
-            ++nonEmpty;
-        }
-        top[i] = t; bot[i] = b;
-    }
-
-    ++S.frame;
-
-    // Nombre de colonnes ayant du contenu dans la bande collée sous l'image (lignes après `contentBot`).
-    // Les sous-titres sont plus bas, vers le centre de la bande noire, et ne la touchent pas.
-    auto bottomEdgeIntrusions = [&](int contentBot) {
-        const int barH  = h - 1 - contentBot;
-        const int band0 = contentBot + 2;
-        int band1 = band0 + (barH / 5 > 2 ? barH / 5 : 2);
-        if (band1 > h) band1 = h;
-        int n = 0;
-        for (int i = 0; i < kInnerCols; ++i)
-            for (int y = band0; y < band1; ++y)
-                if (!IsBlack(px(kPillarCols + i, y))) { ++n; break; }
-        return n;
-    };
-
-    if (S.active) {
-        const char* why = nullptr;
-        if (!pillarBlack) {
-            why = "bandes latérales non noires";
-        } else if (nonEmpty > 0) {
-            int topIntr = 0;
-            for (int i = 0; i < kInnerCols; ++i)
-                if (top[i] >= 0 && top[i] < S.lockTop - 1) ++topIntr;
-
-            if (topIntr >= 3) why = "contenu dans la bande du haut";
-            else if (bottomEdgeIntrusions(S.lockBot) >= kInnerCols / 4) why = "contenu dans la bande du bas";
-        }
-        if (why) {
-            S.active = false;
-            S.streak = 0;
-            Log("Fin de cinématique (%s)", why);
-        }
-        return;
-    }
-
-    bool valid = false;
-    int T = -1, B = -1;
-    if (pillarBlack && nonEmpty >= kInnerCols / 2 && top[0] >= 0 && top[kInnerCols - 1] >= 0) {
-        // Bord haut = première ligne non noire ; bord bas attendu = symétrique (letterbox centré).
-        // Le bas réel ne sert pas à trouver le bord : des sous-titres peuvent occuper la bande du bas.
-        T = h;
-        for (int i = 0; i < kInnerCols; ++i)
-            if (top[i] >= 0 && top[i] < T) T = top[i];
-        B = h - 1 - T;
-        const int tol = h / 100 + 2;
-        int edgeT = 0, edgeB = 0;
-        for (int i = 0; i < kInnerCols; ++i) {
-            if (top[i] < 0) continue;
-            if (top[i] <= T + 1) ++edgeT;
-            if (bot[i] >= B - tol && bot[i] <= B + tol) ++edgeB;
-        }
-        // Affine B sur le bord réellement observé (colonnes qui s'arrêtent près du bord attendu).
-        int bMax = -1;
-        for (int i = 0; i < kInnerCols; ++i)
-            if (top[i] >= 0 && bot[i] >= B - tol && bot[i] <= B + tol && bot[i] > bMax) bMax = bot[i];
-        if (bMax >= 0) B = bMax;
-        const int ch = B - T + 1;
-        const double aspect = (double)S.x43 / ch;
-        valid = edgeT * 2 >= nonEmpty && edgeT >= 6 &&
-                edgeB * 3 >= nonEmpty && edgeB >= 6 &&
-                T >= h * 4 / 100 &&
-                bottomEdgeIntrusions(B) < kInnerCols / 4 &&
-                aspect >= 1.45 && aspect <= 2.6;
-    }
-
-    if (valid && S.streak > 0 && abs(T - S.candTop) <= 1 && abs(B - S.candBot) <= 1) ++S.streak;
-    else S.streak = valid ? 1 : 0;
-    if (valid) { S.candTop = T; S.candBot = B; }
-
-    if (S.streak >= kEnterFrames) {
-        S.active  = true;
-        S.lockTop = T;
-        S.lockBot = B;
-        Log("Cinématique détectée : contenu lignes %d-%d (%dx%d, ratio %.3f)",
-            T, B, S.x43, B - T + 1, (double)S.x43 / (B - T + 1));
-    } else if (g_cfg.log && S.frame % 300 == 0) {
-        Log("Analyse : bandes latérales noires=%d colonnes non vides=%d haut=%d bas=%d valide=%d",
-            pillarBlack, nonEmpty, T, B, valid);
-    }
 }
 
 struct Vtx { float x, y, z, rhw, u, v; };
@@ -262,7 +295,9 @@ void Quad(IDirect3DDevice9* dev, float x0, float y0, float x1, float y1, float u
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(Vtx));
 }
 
-void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb)
+// Dessine dans le backbuffer la zone [x0, x0+cw) x [top, bot) de la copie, agrandie (ratio conservé),
+// puis, si demandé, la bande du bas (sous-titres) par-dessus en mode additif.
+void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int x0, int cw, int top, int bot)
 {
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
@@ -278,8 +313,23 @@ void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb)
     D3DVIEWPORT9 vp = { 0, 0, S.w, S.h, 0.f, 1.f };
     dev->SetViewport(&vp);
 
+    const float W = (float)S.w, H = (float)S.h;
+    const float fcw = (float)cw, fch = (float)(bot - top);
+    float scale = W / fcw;
+    if (H / fch < scale) scale = H / fch;
+    const float dw = fcw * scale, dh = fch * scale;
+    const float dx = (W - dw) * 0.5f, dy = (H - dh) * 0.5f;
+
     if (SUCCEEDED(dev->BeginScene())) {
         dev->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.f, 0);
+
+        // 1) image utile agrandie, ratio conservé : Lanczos (repli sur bilinéaire si indisponible)
+        const RECT srcRect = { x0, top, x0 + cw, bot };
+        const RECT dstRect = { (LONG)(dx + 0.5f), (LONG)(dy + 0.5f), (LONG)(dx + dw + 0.5f), (LONG)(dy + dh + 0.5f) };
+        const bool lanczos = Resample(dev, S.copyTex, srcRect, bb, dstRect);
+        dev->SetRenderTarget(0, bb);
+        D3DVIEWPORT9 full = { 0, 0, S.w, S.h, 0.f, 1.f };
+        dev->SetViewport(&full);
 
         dev->SetVertexShader(nullptr);
         dev->SetPixelShader(nullptr);
@@ -317,22 +367,14 @@ void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb)
         dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
         dev->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
 
-        const float W = (float)S.w, H = (float)S.h;
-        const int   srcTop = S.lockTop, srcBot = S.lockBot + 1; // [srcTop, srcBot)
-        const float cw = (float)S.x43, ch = (float)(srcBot - srcTop);
-        float scale = W / cw;
-        if (H / ch < scale) scale = H / ch;
-        const float dw = cw * scale, dh = ch * scale;
-        const float dx = (W - dw) * 0.5f, dy = (H - dh) * 0.5f;
+        if (!lanczos) {
+            dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            Quad(dev, dx, dy, dx + dw, dy + dh, x0 / W, top / H, (x0 + cw) / W, bot / H);
+        }
 
-        // 1) image utile agrandie, ratio conservé
-        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        Quad(dev, dx, dy, dx + dw, dy + dh,
-             S.x0 / W, srcTop / H, (S.x0 + S.x43) / W, srcBot / H);
-
-        // 2) bande du bas (sous-titres) superposée en addition : le noir n'ajoute rien.
-        const int barH = (int)S.h - srcBot;
+        // 2) bande du bas (sous-titres sur fond noir) superposée en addition : le noir n'ajoute rien.
+        const int barH = (int)S.h - bot;
         if (g_cfg.keepSubtitles && barH > 0) {
             dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
             dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
@@ -340,9 +382,7 @@ void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb)
             dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
             dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
             dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-            const float sx = (W - cw) * 0.5f;
-            Quad(dev, sx, H - barH, sx + cw, H,
-                 S.x0 / W, srcBot / H, (S.x0 + S.x43) / W, 1.f);
+            Quad(dev, (float)x0, H - barH, (float)(x0 + cw), H, x0 / W, bot / H, (x0 + cw) / W, 1.f);
         }
 
         dev->EndScene();
@@ -361,37 +401,49 @@ void DrawZoom(IDirect3DDevice9* dev, IDirect3DSurface9* bb)
 
 void ProcessFrame(IDirect3DDevice9* dev)
 {
+    const bool want = Game_LetterboxActive();
+    if (want != S.active) {
+        S.active = want;
+        Log(want ? "Cinématique : plein écran" : "Fin de cinématique");
+    }
+    if (!want) return;
+
     IDirect3DSurface9* bb = nullptr;
     if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
 
     D3DSURFACE_DESC d;
-    if (SUCCEEDED(bb->GetDesc(&d)) && EnsureResources(dev, d) &&
-        SUCCEEDED(dev->StretchRect(bb, nullptr, S.copySurf, nullptr, D3DTEXF_NONE))) {
-        bool ok = true;
-        for (int i = 0; i < kCols && ok; ++i) {
-            RECT src = { S.colX[i], 0, S.colX[i] + 1, (LONG)S.h };
-            RECT dst = { i, 0, i + 1, (LONG)S.h };
-            ok = SUCCEEDED(dev->StretchRect(S.copySurf, &src, S.sampleRT, &dst, D3DTEXF_NONE));
-        }
-        if (ok && SUCCEEDED(dev->GetRenderTargetData(S.sampleRT, S.sampleSys))) {
-            D3DLOCKED_RECT lr;
-            if (SUCCEEDED(S.sampleSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-                Analyze((const BYTE*)lr.pBits, lr.Pitch);
-                S.sampleSys->UnlockRect();
-            }
-        }
-        if (S.active) DrawZoom(dev, bb);
+    if (SUCCEEDED(bb->GetDesc(&d))) {
+        const int w = (int)d.Width, h = (int)d.Height;
+        const int cw = (h * 4 + 1) / 3;                         // largeur de l'image 4/3
+        const float s = h / kUiHeight;
+        const int top = (int)(kContentTop * s + 0.5f);
+        const int bot = (int)(kContentBot * s + 0.5f);
+        if (w >= cw && bot > top && EnsureResources(dev, d) &&
+            SUCCEEDED(dev->StretchRect(bb, nullptr, S.copySurf, nullptr, D3DTEXF_NONE)))
+            DrawZoom(dev, bb, (w - cw) / 2, cw, top, bot);
     }
     bb->Release();
 }
 
 // --- Hooks ------------------------------------------------------------------
 
+// Fin d'image : compteur d'images et taille de l'écran (pour repérer la composition finale).
+void NewFrame(IDirect3DDevice9* dev)
+{
+    ++G.frame;
+    if (!SceneQualityEnabled()) return;
+    IDirect3DSurface9* bb = nullptr;
+    D3DSURFACE_DESC d;
+    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb && SUCCEEDED(bb->GetDesc(&d))) {
+        G.bbW = d.Width; G.bbH = d.Height;
+    }
+    SafeRelease(bb);
+}
+
 HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* rgn)
 {
+    if (!S.inPresent) NewFrame(dev);
     if (S.inPresent || !g_cfg.fullscreenCutscenes) return oPresent(dev, src, dst, wnd, rgn);
-    static bool logged = false;
-    if (!logged) { logged = true; Log("Present (device) src=%p dst=%p", src, dst); }
     S.inPresent = true;
     ProcessFrame(dev);
     HRESULT hr = oPresent(dev, src, dst, wnd, rgn);
@@ -401,9 +453,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src, c
 
 HRESULT STDMETHODCALLTYPE Hook_SCPresent(IDirect3DSwapChain9* sc, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* rgn, DWORD flags)
 {
+    if (!S.inPresent) {
+        IDirect3DDevice9* d = nullptr;
+        if (SUCCEEDED(sc->GetDevice(&d)) && d) { NewFrame(d); d->Release(); }
+    }
     if (S.inPresent || !g_cfg.fullscreenCutscenes) return oSCPresent(sc, src, dst, wnd, rgn, flags);
-    static bool logged = false;
-    if (!logged) { logged = true; Log("Present (swapchain) src=%p dst=%p", src, dst); }
     S.inPresent = true;
     IDirect3DDevice9* dev = nullptr;
     if (SUCCEEDED(sc->GetDevice(&dev)) && dev) {
@@ -418,9 +472,67 @@ HRESULT STDMETHODCALLTYPE Hook_SCPresent(IDirect3DSwapChain9* sc, const RECT* sr
 HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
     ReleaseResources(); // les ressources D3DPOOL_DEFAULT doivent être libérées avant Reset
+    SceneForget();
+    Resampler_OnReset();
     HRESULT hr = oReset(dev, pp);
-    Log("Reset -> 0x%08lX", (unsigned long)hr);
+    Log("Reset -> 0x%08lX (%ux%u, fenêtré=%d)", (unsigned long)hr,
+        pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, pp ? pp->Windowed : -1);
     return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT lv, DWORD usage, D3DFORMAT f,
+                                             D3DPOOL pool, IDirect3DTexture9** out, HANDLE* sh)
+{
+    HRESULT hr = oCreateTexture(dev, w, h, lv, usage, f, pool, out, sh);
+
+    // Images de la scène 4/3 (1920x1440 ou multiple) : à réduire avec un filtre de qualité à la composition.
+    // Liste circulaire : les plus anciennes (scènes recréées depuis) sont remplacées en premier.
+    if (SUCCEEDED(hr) && out && *out && !G.inOwn && !S.inPresent && (usage & D3DUSAGE_RENDERTARGET) &&
+        h >= 1440 && h % 1440 == 0 && w * 3 == h * 4) {
+        G.textures[G.next] = *out;
+        G.next = (G.next + 1) % 16;
+        if (G.count < 16) ++G.count;
+    }
+    return hr;
+}
+
+// --- Suivi de l'état du jeu et interception des dessins (super-sampling) ---
+HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx, IDirect3DSurface9* s)
+{
+    if (idx == 0 && !G.inOwn && !S.inPresent) {
+        D3DSURFACE_DESC d;
+        if (s && SUCCEEDED(s->GetDesc(&d))) { G.rtW = d.Width; G.rtH = d.Height; }
+        else { G.rtW = G.rtH = 0; }
+    }
+    return oSetRenderTarget(dev, idx, s);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirect3DBaseTexture9* t)
+{
+    if (stage < 16 && !G.inOwn && !S.inPresent) G.bound[stage] = t;
+    return oSetTexture(dev, stage, t);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT start, UINT n)
+{
+    return SceneDraw(dev, [&] { return oDrawPrimitive(dev, t, start, n); });
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT minIdx,
+                                                    UINT nv, UINT start, UINT n)
+{
+    return SceneDraw(dev, [&] { return oDrawIndexedPrimitive(dev, t, base, minIdx, nv, start, n); });
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT n, const void* data, UINT stride)
+{
+    return SceneDraw(dev, [&] { return oDrawPrimitiveUP(dev, t, n, data, stride); });
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT minIdx, UINT nv, UINT n,
+                                                      const void* idx, D3DFORMAT fmt, const void* data, UINT stride)
+{
+    return SceneDraw(dev, [&] { return oDrawIndexedPrimitiveUP(dev, t, minIdx, nv, n, idx, fmt, data, stride); });
 }
 
 BOOL STDMETHODCALLTYPE Hook_DevShowCursor(IDirect3DDevice9* dev, BOOL)
@@ -434,6 +546,15 @@ void HookDevice(IDirect3DDevice9* dev)
     if (!oPresent) oPresent = (Present_t)PatchVTable(dev, kVT_Dev_Present, (void*)Hook_Present);
     if (g_cfg.hideCursor && !oDevShowCursor)
         oDevShowCursor = (DevShowCursor_t)PatchVTable(dev, kVT_Dev_ShowCursor, (void*)Hook_DevShowCursor);
+    if (SceneQualityEnabled() && !oSetTexture) { // super-sampling : composition finale en Lanczos
+        oCreateTexture          = (CreateTexture_t)PatchVTable(dev, 23, (void*)Hook_CreateTexture);
+        oSetRenderTarget        = (SetRenderTarget_t)PatchVTable(dev, 37, (void*)Hook_SetRenderTarget);
+        oSetTexture             = (SetTexture_t)PatchVTable(dev, 65, (void*)Hook_SetTexture);
+        oDrawPrimitive          = (DrawPrimitive_t)PatchVTable(dev, 81, (void*)Hook_DrawPrimitive);
+        oDrawIndexedPrimitive   = (DrawIndexedPrimitive_t)PatchVTable(dev, 82, (void*)Hook_DrawIndexedPrimitive);
+        oDrawPrimitiveUP        = (DrawPrimitiveUP_t)PatchVTable(dev, 83, (void*)Hook_DrawPrimitiveUP);
+        oDrawIndexedPrimitiveUP = (DrawIndexedPrimitiveUP_t)PatchVTable(dev, 84, (void*)Hook_DrawIndexedPrimitiveUP);
+    }
 
     IDirect3DSwapChain9* sc = nullptr;
     if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
@@ -447,9 +568,9 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter, D3DDE
                                             D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out)
 {
     // Un périphérique "pur" ne permet pas de sauvegarder/restaurer l'état : on retire ce drapeau.
-    if (g_cfg.fullscreenCutscenes) flags &= ~D3DCREATE_PUREDEVICE;
+    if (g_cfg.fullscreenCutscenes || SceneQualityEnabled()) flags &= ~D3DCREATE_PUREDEVICE;
     HRESULT hr = oCreateDevice(d3d, adapter, type, wnd, flags, pp, out);
-    Log("CreateDevice -> 0x%08lX (flags=0x%lX, %ux%u, fenêtré=%d)", (unsigned long)hr, flags,
+    Log("CreateDevice -> 0x%08lX (%ux%u, fenêtré=%d)", (unsigned long)hr,
         pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, pp ? pp->Windowed : -1);
     if (SUCCEEDED(hr) && out && *out) HookDevice(*out);
     return hr;
